@@ -12,13 +12,15 @@ import inspect
 import json
 import logging
 import os
-import random
+import pathlib
+import platform
 import re
 import time
 
 from . import coverage
 from .authproxy import AuthServiceProxy, JSONRPCException
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 logger = logging.getLogger("TestFramework.utils")
 
@@ -50,7 +52,24 @@ def assert_fee_amount(fee, tx_size, feerate_BTC_kvB):
         raise AssertionError("Fee of %s BTC too high! (Should be %s BTC)" % (str(fee), str(target_fee)))
 
 
+def summarise_dict_differences(thing1, thing2):
+    if not isinstance(thing1, dict) or not isinstance(thing2, dict):
+        return thing1, thing2
+    d1, d2 = {}, {}
+    for k in sorted(thing1.keys()):
+        if k not in thing2:
+            d1[k] = thing1[k]
+        elif thing1[k] != thing2[k]:
+            d1[k], d2[k] = summarise_dict_differences(thing1[k], thing2[k])
+    for k in sorted(thing2.keys()):
+        if k not in thing1:
+            d2[k] = thing2[k]
+    return d1, d2
+
 def assert_equal(thing1, thing2, *args):
+    if thing1 != thing2 and not args and isinstance(thing1, dict) and isinstance(thing2, dict):
+        d1,d2 = summarise_dict_differences(thing1, thing2)
+        raise AssertionError("not(%s == %s)\n  in particular not(%s == %s)" % (thing1, thing2, d1, d2))
     if thing1 != thing2 or any(thing1 != arg for arg in args):
         raise AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
 
@@ -209,12 +228,6 @@ def check_json_precision():
         raise RuntimeError("JSON encode/decode loses precision")
 
 
-def EncodeDecimal(o):
-    if isinstance(o, Decimal):
-        return str(o)
-    raise TypeError(repr(o) + " is not JSON serializable")
-
-
 def count_bytes(hex_string):
     return len(bytearray.fromhex(hex_string))
 
@@ -245,7 +258,7 @@ def satoshi_round(amount):
     return Decimal(amount).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 
-def wait_until_helper(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=None, timeout_factor=1.0):
+def wait_until_helper_internal(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=None, timeout_factor=1.0):
     """Sleep until the predicate resolves to be True.
 
     Warning: Note that this method is not recommended to be used in tests as it is
@@ -291,12 +304,6 @@ def sha256sum_file(filename):
     return h.digest()
 
 
-# TODO: Remove and use random.randbytes(n) instead, available in Python 3.9
-def random_bytes(n):
-    """Return a random bytes object of length n."""
-    return bytes(random.getrandbits(8) for i in range(n))
-
-
 # RPC/P2P connection constants and functions
 ############################################
 
@@ -313,7 +320,7 @@ class PortSeed:
     n = None
 
 
-def get_rpc_proxy(url: str, node_number: int, *, timeout: int=None, coveragedir: str=None) -> coverage.AuthServiceProxyWrapper:
+def get_rpc_proxy(url: str, node_number: int, *, timeout: Optional[int]=None, coveragedir: Optional[str]=None) -> coverage.AuthServiceProxyWrapper:
     """
     Args:
         url: URL of the RPC server to call
@@ -408,6 +415,7 @@ def write_config(config_path, *, n, chain, extra_config="", disable_autoconnect=
         f.write("upnp=0\n")
         f.write("natpmp=0\n")
         f.write("shrinkdebugfile=0\n")
+        f.write("deprecatedrpc=create_bdb\n")  # Required to run the tests
         # To improve SQLite wallet performance so that the tests don't timeout, use -unsafesqlitesync
         f.write("unsafesqlitesync=1\n")
         if disable_autoconnect:
@@ -416,7 +424,23 @@ def write_config(config_path, *, n, chain, extra_config="", disable_autoconnect=
 
 
 def get_datadir_path(dirname, n):
-    return os.path.join(dirname, "node" + str(n))
+    return pathlib.Path(dirname) / f"node{n}"
+
+
+def get_temp_default_datadir(temp_dir: pathlib.Path) -> tuple[dict, pathlib.Path]:
+    """Return os-specific environment variables that can be set to make the
+    GetDefaultDataDir() function return a datadir path under the provided
+    temp_dir, as well as the complete path it would return."""
+    if platform.system() == "Windows":
+        env = dict(APPDATA=str(temp_dir))
+        datadir = temp_dir / "Bitcoin"
+    else:
+        env = dict(HOME=str(temp_dir))
+        if platform.system() == "Darwin":
+            datadir = temp_dir / "Library/Application Support/Bitcoin"
+        else:
+            datadir = temp_dir / ".bitcoin"
+    return env, datadir
 
 
 def append_config(datadir, options):
@@ -472,21 +496,58 @@ def check_node_connections(*, node, num_in, num_out):
     assert_equal(info["connections_in"], num_in)
     assert_equal(info["connections_out"], num_out)
 
+def fill_mempool(test_framework, node, miniwallet):
+    """Fill mempool until eviction.
+
+    Allows for simpler testing of scenarios with floating mempoolminfee > minrelay
+    Requires -datacarriersize=100000 and
+   -maxmempool=5.
+    It will not ensure mempools become synced as it
+    is based on a single node and assumes -minrelaytxfee
+    is 1 sat/vbyte.
+    """
+    test_framework.log.info("Fill the mempool until eviction is triggered and the mempoolminfee rises")
+    txouts = gen_return_txouts()
+    relayfee = node.getnetworkinfo()['relayfee']
+
+    assert_equal(relayfee, Decimal('0.00001000'))
+
+    tx_batch_size = 1
+    num_of_batches = 75
+    # Generate UTXOs to flood the mempool
+    # 1 to create a tx initially that will be evicted from the mempool later
+    # 75 transactions each with a fee rate higher than the previous one
+    test_framework.generate(miniwallet, 1 + (num_of_batches * tx_batch_size))
+
+    # Mine COINBASE_MATURITY - 1 blocks so that the UTXOs are allowed to be spent
+    test_framework.generate(node, 100 - 1)
+
+    test_framework.log.debug("Create a mempool tx that will be evicted")
+    tx_to_be_evicted_id = miniwallet.send_self_transfer(from_node=node, fee_rate=relayfee)["txid"]
+
+    # Increase the tx fee rate to give the subsequent transactions a higher priority in the mempool
+    # The tx has an approx. vsize of 65k, i.e. multiplying the previous fee rate (in sats/kvB)
+    # by 130 should result in a fee that corresponds to 2x of that fee rate
+    base_fee = relayfee * 130
+
+    test_framework.log.debug("Fill up the mempool with txs with higher fee rate")
+    with node.assert_debug_log(["rolling minimum fee bumped"]):
+        for batch_of_txid in range(num_of_batches):
+            fee = (batch_of_txid + 1) * base_fee
+            create_lots_of_big_transactions(miniwallet, node, fee, tx_batch_size, txouts)
+
+    test_framework.log.debug("The tx should be evicted by now")
+    # The number of transactions created should be greater than the ones present in the mempool
+    assert_greater_than(tx_batch_size * num_of_batches, len(node.getrawmempool()))
+    # Initial tx created should not be present in the mempool anymore as it had a lower fee rate
+    assert tx_to_be_evicted_id not in node.getrawmempool()
+
+    test_framework.log.debug("Check that mempoolminfee is larger than minrelaytxfee")
+    assert_equal(node.getmempoolinfo()['minrelaytxfee'], Decimal('0.00001000'))
+    assert_greater_than(node.getmempoolinfo()['mempoolminfee'], Decimal('0.00001000'))
 
 # Transaction/Block functions
 #############################
-
-
-def find_output(node, txid, amount, *, blockhash=None):
-    """
-    Return index to output of txid with value amount
-    Raises exception if there is none.
-    """
-    txdata = node.getrawtransaction(txid, 1, blockhash)
-    for i in range(len(txdata["vout"])):
-        if txdata["vout"][i]["value"] == amount:
-            return i
-    raise RuntimeError("find_output txid %s : %s not found" % (txid, str(amount)))
 
 
 # Create large OP_RETURN txouts that can be appended to a transaction

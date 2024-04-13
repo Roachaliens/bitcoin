@@ -6,8 +6,6 @@
 #ifndef BITCOIN_UTIL_TIME_H
 #define BITCOIN_UTIL_TIME_H
 
-#include <compat/compat.h>
-
 #include <chrono> // IWYU pragma: export
 #include <cstdint>
 #include <string>
@@ -71,9 +69,6 @@ using MillisecondsDouble = std::chrono::duration<double, std::chrono::millisecon
  */
 int64_t GetTime();
 
-/** Returns the system time (not mockable) */
-int64_t GetTimeMillis();
-
 /**
  * DEPRECATED
  * Use SetMockTime with chrono type
@@ -120,8 +115,5 @@ struct timeval MillisToTimeval(int64_t nTimeout);
  * Convert milliseconds to a struct timeval for e.g. select.
  */
 struct timeval MillisToTimeval(std::chrono::milliseconds ms);
-
-/** Sanity check epoch match normal Unix epoch */
-bool ChronoSanityCheck();
 
 #endif // BITCOIN_UTIL_TIME_H

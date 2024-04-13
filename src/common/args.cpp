@@ -6,14 +6,15 @@
 #include <common/args.h>
 
 #include <chainparamsbase.h>
+#include <common/settings.h>
 #include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
-#include <util/settings.h>
 #include <util/strencodings.h>
 
 #ifdef WIN32
@@ -27,12 +28,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 
 const char * const BITCOIN_CONF_FILENAME = "bitcoin.conf";
 const char * const BITCOIN_SETTINGS_FILENAME = "settings.json";
@@ -102,7 +103,7 @@ KeyInfo InterpretKey(std::string key)
  * @return parsed settings value if it is valid, otherwise nullopt accompanied
  * by a descriptive error string
  */
-std::optional<util::SettingsValue> InterpretValue(const KeyInfo& key, const std::string* value,
+std::optional<common::SettingsValue> InterpretValue(const KeyInfo& key, const std::string* value,
                                                   unsigned int flags, std::string& error)
 {
     // Return negated settings as false values.
@@ -141,7 +142,7 @@ std::set<std::string> ArgsManager::GetUnsuitableSectionOnlyArgs() const
     if (m_network.empty()) return std::set<std::string> {};
 
     // if it's okay to use the default section for this network, don't worry
-    if (m_network == CBaseChainParams::MAIN) return std::set<std::string> {};
+    if (m_network == ChainTypeToString(ChainType::MAIN)) return std::set<std::string> {};
 
     for (const auto& arg : m_network_only_args) {
         if (OnlyHasDefaultSectionSetting(m_settings, m_network, SettingName(arg))) {
@@ -155,10 +156,10 @@ std::list<SectionInfo> ArgsManager::GetUnrecognizedSections() const
 {
     // Section names to be recognized in the config file.
     static const std::set<std::string> available_sections{
-        CBaseChainParams::REGTEST,
-        CBaseChainParams::SIGNET,
-        CBaseChainParams::TESTNET,
-        CBaseChainParams::MAIN
+        ChainTypeToString(ChainType::REGTEST),
+        ChainTypeToString(ChainType::SIGNET),
+        ChainTypeToString(ChainType::TESTNET),
+        ChainTypeToString(ChainType::MAIN),
     };
 
     LOCK(cs_args);
@@ -214,7 +215,7 @@ bool ArgsManager::ParseParameters(int argc, const char* const argv[], std::strin
             m_command.push_back(key);
             while (++i < argc) {
                 // The remaining args are command args
-                m_command.push_back(argv[i]);
+                m_command.emplace_back(argv[i]);
             }
             break;
         }
@@ -236,15 +237,15 @@ bool ArgsManager::ParseParameters(int argc, const char* const argv[], std::strin
             return false;
         }
 
-        std::optional<util::SettingsValue> value = InterpretValue(keyinfo, val ? &*val : nullptr, *flags, error);
+        std::optional<common::SettingsValue> value = InterpretValue(keyinfo, val ? &*val : nullptr, *flags, error);
         if (!value) return false;
 
         m_settings.command_line_options[keyinfo.name].push_back(*value);
     }
 
     // we do not allow -includeconf from command line, only -noincludeconf
-    if (auto* includes = util::FindKey(m_settings.command_line_options, "includeconf")) {
-        const util::SettingsSpan values{*includes};
+    if (auto* includes = common::FindKey(m_settings.command_line_options, "includeconf")) {
+        const common::SettingsSpan values{*includes};
         // Range may be empty if -noincludeconf was passed
         if (!values.empty()) {
             error = "-includeconf cannot be used from commandline; -includeconf=" + values.begin()->write();
@@ -276,7 +277,7 @@ fs::path ArgsManager::GetPathArg(std::string arg, const fs::path& default_value)
     return result.has_filename() ? result : result.parent_path();
 }
 
-const fs::path& ArgsManager::GetBlocksDirPath() const
+fs::path ArgsManager::GetBlocksDirPath() const
 {
     LOCK(cs_args);
     fs::path& path = m_cached_blocks_path;
@@ -301,7 +302,7 @@ const fs::path& ArgsManager::GetBlocksDirPath() const
     return path;
 }
 
-const fs::path& ArgsManager::GetDataDir(bool net_specific) const
+fs::path ArgsManager::GetDataDir(bool net_specific) const
 {
     LOCK(cs_args);
     fs::path& path = net_specific ? m_cached_network_datadir_path : m_cached_datadir_path;
@@ -359,7 +360,7 @@ std::optional<const ArgsManager::Command> ArgsManager::GetCommand() const
 std::vector<std::string> ArgsManager::GetArgs(const std::string& strArg) const
 {
     std::vector<std::string> result;
-    for (const util::SettingsValue& value : GetSettingsList(strArg)) {
+    for (const common::SettingsValue& value : GetSettingsList(strArg)) {
         result.push_back(value.isFalse() ? "0" : value.isTrue() ? "1" : value.get_str());
     }
     return result;
@@ -406,7 +407,7 @@ bool ArgsManager::ReadSettingsFile(std::vector<std::string>* errors)
     LOCK(cs_args);
     m_settings.rw_settings.clear();
     std::vector<std::string> read_errors;
-    if (!util::ReadSettings(path, m_settings.rw_settings, read_errors)) {
+    if (!common::ReadSettings(path, m_settings.rw_settings, read_errors)) {
         SaveErrors(read_errors, errors);
         return false;
     }
@@ -428,7 +429,7 @@ bool ArgsManager::WriteSettingsFile(std::vector<std::string>* errors, bool backu
 
     LOCK(cs_args);
     std::vector<std::string> write_errors;
-    if (!util::WriteSettings(path_tmp, m_settings.rw_settings, write_errors)) {
+    if (!common::WriteSettings(path_tmp, m_settings.rw_settings, write_errors)) {
         SaveErrors(write_errors, errors);
         return false;
     }
@@ -439,11 +440,11 @@ bool ArgsManager::WriteSettingsFile(std::vector<std::string>* errors, bool backu
     return true;
 }
 
-util::SettingsValue ArgsManager::GetPersistentSetting(const std::string& name) const
+common::SettingsValue ArgsManager::GetPersistentSetting(const std::string& name) const
 {
     LOCK(cs_args);
-    return util::GetSetting(m_settings, m_network, name, !UseDefaultSection("-" + name),
-        /*ignore_nonpersistent=*/true, /*get_chain_name=*/false);
+    return common::GetSetting(m_settings, m_network, name, !UseDefaultSection("-" + name),
+        /*ignore_nonpersistent=*/true, /*get_chain_type=*/false);
 }
 
 bool ArgsManager::IsArgNegated(const std::string& strArg) const
@@ -458,11 +459,11 @@ std::string ArgsManager::GetArg(const std::string& strArg, const std::string& st
 
 std::optional<std::string> ArgsManager::GetArg(const std::string& strArg) const
 {
-    const util::SettingsValue value = GetSetting(strArg);
+    const common::SettingsValue value = GetSetting(strArg);
     return SettingToString(value);
 }
 
-std::optional<std::string> SettingToString(const util::SettingsValue& value)
+std::optional<std::string> SettingToString(const common::SettingsValue& value)
 {
     if (value.isNull()) return std::nullopt;
     if (value.isFalse()) return "0";
@@ -471,7 +472,7 @@ std::optional<std::string> SettingToString(const util::SettingsValue& value)
     return value.get_str();
 }
 
-std::string SettingToString(const util::SettingsValue& value, const std::string& strDefault)
+std::string SettingToString(const common::SettingsValue& value, const std::string& strDefault)
 {
     return SettingToString(value).value_or(strDefault);
 }
@@ -483,11 +484,11 @@ int64_t ArgsManager::GetIntArg(const std::string& strArg, int64_t nDefault) cons
 
 std::optional<int64_t> ArgsManager::GetIntArg(const std::string& strArg) const
 {
-    const util::SettingsValue value = GetSetting(strArg);
+    const common::SettingsValue value = GetSetting(strArg);
     return SettingToInt(value);
 }
 
-std::optional<int64_t> SettingToInt(const util::SettingsValue& value)
+std::optional<int64_t> SettingToInt(const common::SettingsValue& value)
 {
     if (value.isNull()) return std::nullopt;
     if (value.isFalse()) return 0;
@@ -496,7 +497,7 @@ std::optional<int64_t> SettingToInt(const util::SettingsValue& value)
     return LocaleIndependentAtoi<int64_t>(value.get_str());
 }
 
-int64_t SettingToInt(const util::SettingsValue& value, int64_t nDefault)
+int64_t SettingToInt(const common::SettingsValue& value, int64_t nDefault)
 {
     return SettingToInt(value).value_or(nDefault);
 }
@@ -508,18 +509,18 @@ bool ArgsManager::GetBoolArg(const std::string& strArg, bool fDefault) const
 
 std::optional<bool> ArgsManager::GetBoolArg(const std::string& strArg) const
 {
-    const util::SettingsValue value = GetSetting(strArg);
+    const common::SettingsValue value = GetSetting(strArg);
     return SettingToBool(value);
 }
 
-std::optional<bool> SettingToBool(const util::SettingsValue& value)
+std::optional<bool> SettingToBool(const common::SettingsValue& value)
 {
     if (value.isNull()) return std::nullopt;
     if (value.isBool()) return value.get_bool();
     return InterpretBool(value.get_str());
 }
 
-bool SettingToBool(const util::SettingsValue& value, bool fDefault)
+bool SettingToBool(const common::SettingsValue& value, bool fDefault)
 {
     return SettingToBool(value).value_or(fDefault);
 }
@@ -681,6 +682,18 @@ std::string HelpMessageOpt(const std::string &option, const std::string &message
            std::string("\n\n");
 }
 
+const std::vector<std::string> TEST_OPTIONS_DOC{
+    "addrman (use deterministic addrman)",
+};
+
+bool HasTestOption(const ArgsManager& args, const std::string& test_option)
+{
+    const auto options = args.GetArgs("-test");
+    return std::any_of(options.begin(), options.end(), [test_option](const auto& option) {
+        return option == test_option;
+    });
+}
+
 fs::path GetDefaultDataDir()
 {
     // Windows: C:\Users\Username\AppData\Roaming\Bitcoin
@@ -714,62 +727,84 @@ bool CheckDataDirOption(const ArgsManager& args)
 
 fs::path ArgsManager::GetConfigFilePath() const
 {
-    return GetConfigFile(*this, GetPathArg("-conf", BITCOIN_CONF_FILENAME));
+    LOCK(cs_args);
+    return *Assert(m_config_path);
 }
 
-std::string ArgsManager::GetChainName() const
+void ArgsManager::SetConfigFilePath(fs::path path)
+{
+    LOCK(cs_args);
+    assert(!m_config_path);
+    m_config_path = path;
+}
+
+ChainType ArgsManager::GetChainType() const
+{
+    std::variant<ChainType, std::string> arg = GetChainArg();
+    if (auto* parsed = std::get_if<ChainType>(&arg)) return *parsed;
+    throw std::runtime_error(strprintf("Unknown chain %s.", std::get<std::string>(arg)));
+}
+
+std::string ArgsManager::GetChainTypeString() const
+{
+    auto arg = GetChainArg();
+    if (auto* parsed = std::get_if<ChainType>(&arg)) return ChainTypeToString(*parsed);
+    return std::get<std::string>(arg);
+}
+
+std::variant<ChainType, std::string> ArgsManager::GetChainArg() const
 {
     auto get_net = [&](const std::string& arg) {
         LOCK(cs_args);
-        util::SettingsValue value = util::GetSetting(m_settings, /* section= */ "", SettingName(arg),
+        common::SettingsValue value = common::GetSetting(m_settings, /* section= */ "", SettingName(arg),
             /* ignore_default_section_config= */ false,
             /*ignore_nonpersistent=*/false,
-            /* get_chain_name= */ true);
+            /* get_chain_type= */ true);
         return value.isNull() ? false : value.isBool() ? value.get_bool() : InterpretBool(value.get_str());
     };
 
     const bool fRegTest = get_net("-regtest");
     const bool fSigNet  = get_net("-signet");
     const bool fTestNet = get_net("-testnet");
-    const bool is_chain_arg_set = IsArgSet("-chain");
+    const auto chain_arg = GetArg("-chain");
 
-    if ((int)is_chain_arg_set + (int)fRegTest + (int)fSigNet + (int)fTestNet > 1) {
+    if ((int)chain_arg.has_value() + (int)fRegTest + (int)fSigNet + (int)fTestNet > 1) {
         throw std::runtime_error("Invalid combination of -regtest, -signet, -testnet and -chain. Can use at most one.");
     }
-    if (fRegTest)
-        return CBaseChainParams::REGTEST;
-    if (fSigNet) {
-        return CBaseChainParams::SIGNET;
+    if (chain_arg) {
+        if (auto parsed = ChainTypeFromString(*chain_arg)) return *parsed;
+        // Not a known string, so return original string
+        return *chain_arg;
     }
-    if (fTestNet)
-        return CBaseChainParams::TESTNET;
-
-    return GetArg("-chain", CBaseChainParams::MAIN);
+    if (fRegTest) return ChainType::REGTEST;
+    if (fSigNet) return ChainType::SIGNET;
+    if (fTestNet) return ChainType::TESTNET;
+    return ChainType::MAIN;
 }
 
 bool ArgsManager::UseDefaultSection(const std::string& arg) const
 {
-    return m_network == CBaseChainParams::MAIN || m_network_only_args.count(arg) == 0;
+    return m_network == ChainTypeToString(ChainType::MAIN) || m_network_only_args.count(arg) == 0;
 }
 
-util::SettingsValue ArgsManager::GetSetting(const std::string& arg) const
+common::SettingsValue ArgsManager::GetSetting(const std::string& arg) const
 {
     LOCK(cs_args);
-    return util::GetSetting(
+    return common::GetSetting(
         m_settings, m_network, SettingName(arg), !UseDefaultSection(arg),
-        /*ignore_nonpersistent=*/false, /*get_chain_name=*/false);
+        /*ignore_nonpersistent=*/false, /*get_chain_type=*/false);
 }
 
-std::vector<util::SettingsValue> ArgsManager::GetSettingsList(const std::string& arg) const
+std::vector<common::SettingsValue> ArgsManager::GetSettingsList(const std::string& arg) const
 {
     LOCK(cs_args);
-    return util::GetSettingsList(m_settings, m_network, SettingName(arg), !UseDefaultSection(arg));
+    return common::GetSettingsList(m_settings, m_network, SettingName(arg), !UseDefaultSection(arg));
 }
 
 void ArgsManager::logArgsPrefix(
     const std::string& prefix,
     const std::string& section,
-    const std::map<std::string, std::vector<util::SettingsValue>>& args) const
+    const std::map<std::string, std::vector<common::SettingsValue>>& args) const
 {
     std::string section_str = section.empty() ? "" : "[" + section + "] ";
     for (const auto& arg : args) {

@@ -4,12 +4,13 @@
 
 #include <common/args.h>
 
+#include <common/settings.h>
 #include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/fs.h>
-#include <util/settings.h>
 #include <util/string.h>
 
 #include <algorithm>
@@ -25,11 +26,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-fs::path GetConfigFile(const ArgsManager& args, const fs::path& configuration_file_path)
-{
-    return AbsPathForConfigVal(args, configuration_file_path, /*net_specific=*/false);
-}
 
 static bool GetConfigOptions(std::istream& stream, const std::string& filepath, std::string& error, std::vector<std::pair<std::string, std::string>>& options, std::list<SectionInfo>& sections)
 {
@@ -102,7 +98,7 @@ bool ArgsManager::ReadConfigStream(std::istream& stream, const std::string& file
         std::optional<unsigned int> flags = GetArgFlags('-' + key.name);
         if (!IsConfSupported(key, error)) return false;
         if (flags) {
-            std::optional<util::SettingsValue> value = InterpretValue(key, &option.second, *flags, error);
+            std::optional<common::SettingsValue> value = InterpretValue(key, &option.second, *flags, error);
             if (!value) {
                 return false;
             }
@@ -125,6 +121,7 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
         LOCK(cs_args);
         m_settings.ro_config.clear();
         m_config_sections.clear();
+        m_config_path = AbsPathForConfigVal(*this, GetPathArg("-conf", BITCOIN_CONF_FILENAME), /*net_specific=*/false);
     }
 
     const auto conf_path{GetConfigFilePath()};
@@ -145,22 +142,22 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
         bool use_conf_file{true};
         {
             LOCK(cs_args);
-            if (auto* includes = util::FindKey(m_settings.command_line_options, "includeconf")) {
+            if (auto* includes = common::FindKey(m_settings.command_line_options, "includeconf")) {
                 // ParseParameters() fails if a non-negated -includeconf is passed on the command-line
-                assert(util::SettingsSpan(*includes).last_negated());
+                assert(common::SettingsSpan(*includes).last_negated());
                 use_conf_file = false;
             }
         }
         if (use_conf_file) {
-            std::string chain_id = GetChainName();
+            std::string chain_id = GetChainTypeString();
             std::vector<std::string> conf_file_names;
 
             auto add_includes = [&](const std::string& network, size_t skip = 0) {
                 size_t num_values = 0;
                 LOCK(cs_args);
-                if (auto* section = util::FindKey(m_settings.ro_config, network)) {
-                    if (auto* values = util::FindKey(*section, "includeconf")) {
-                        for (size_t i = std::max(skip, util::SettingsSpan(*values).negated()); i < values->size(); ++i) {
+                if (auto* section = common::FindKey(m_settings.ro_config, network)) {
+                    if (auto* values = common::FindKey(*section, "includeconf")) {
+                        for (size_t i = std::max(skip, common::SettingsSpan(*values).negated()); i < values->size(); ++i) {
                             conf_file_names.push_back((*values)[i].get_str());
                         }
                         num_values = values->size();
@@ -175,7 +172,7 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
             const size_t default_includes = add_includes({});
 
             for (const std::string& conf_file_name : conf_file_names) {
-                std::ifstream conf_file_stream{GetConfigFile(*this, fs::PathFromString(conf_file_name))};
+                std::ifstream conf_file_stream{AbsPathForConfigVal(*this, fs::PathFromString(conf_file_name), /*net_specific=*/false)};
                 if (conf_file_stream.good()) {
                     if (!ReadConfigStream(conf_file_stream, conf_file_name, error, ignore_invalid_keys)) {
                         return false;
@@ -191,7 +188,7 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
             conf_file_names.clear();
             add_includes(chain_id, /* skip= */ chain_includes);
             add_includes({}, /* skip= */ default_includes);
-            std::string chain_id_final = GetChainName();
+            std::string chain_id_final = GetChainTypeString();
             if (chain_id_final != chain_id) {
                 // Also warn about recursive includeconf for the chain that was specified in one of the includeconfs
                 add_includes(chain_id_final);

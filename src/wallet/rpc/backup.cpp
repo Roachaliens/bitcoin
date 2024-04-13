@@ -2,6 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#if defined(HAVE_CONFIG_H)
+#include <config/bitcoin-config.h>
+#endif
+
 #include <chain.h>
 #include <clientversion.h>
 #include <core_io.h>
@@ -12,7 +16,7 @@
 #include <rpc/util.h>
 #include <script/descriptor.h>
 #include <script/script.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <sync.h>
 #include <uint256.h>
 #include <util/bip32.h>
@@ -394,14 +398,8 @@ RPCHelpMan removeprunedfunds()
     uint256 hash(ParseHashV(request.params[0], "txid"));
     std::vector<uint256> vHash;
     vHash.push_back(hash);
-    std::vector<uint256> vHashOut;
-
-    if (pwallet->ZapSelectTx(vHash, vHashOut) != DBErrors::LOAD_OK) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Could not properly delete the transaction.");
-    }
-
-    if(vHashOut.empty()) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Transaction does not exist in wallet.");
+    if (auto res = pwallet->RemoveTxs(vHash); !res) {
+        throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
     }
 
     return UniValue::VNULL;
@@ -573,13 +571,13 @@ RPCHelpMan importwallet()
                     }
                 }
                 nTimeBegin = std::min(nTimeBegin, nTime);
-                keys.push_back(std::make_tuple(key, nTime, fLabel, strLabel));
+                keys.emplace_back(key, nTime, fLabel, strLabel);
             } else if(IsHex(vstr[0])) {
                 std::vector<unsigned char> vData(ParseHex(vstr[0]));
                 CScript script = CScript(vData.begin(), vData.end());
                 int64_t birth_time = ParseISO8601DateTime(vstr[1]);
                 if (birth_time > 0) nTimeBegin = std::min(nTimeBegin, birth_time);
-                scripts.push_back(std::pair<CScript, int64_t>(script, birth_time));
+                scripts.emplace_back(script, birth_time);
             }
         }
         file.close();
@@ -734,7 +732,7 @@ RPCHelpMan dumpwallet()
      * It may also avoid other security issues.
      */
     if (fs::exists(filepath)) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, filepath.u8string() + " already exists. If you are sure this is what you want, move it out of the way first");
+        throw JSONRPCError(RPC_INVALID_PARAMETER, filepath.utf8string() + " already exists. If you are sure this is what you want, move it out of the way first");
     }
 
     std::ofstream file;
@@ -759,7 +757,7 @@ RPCHelpMan dumpwallet()
     std::vector<std::pair<int64_t, CKeyID> > vKeyBirth;
     vKeyBirth.reserve(mapKeyBirth.size());
     for (const auto& entry : mapKeyBirth) {
-        vKeyBirth.push_back(std::make_pair(entry.second, entry.first));
+        vKeyBirth.emplace_back(entry.second, entry.first);
     }
     mapKeyBirth.clear();
     std::sort(vKeyBirth.begin(), vKeyBirth.end());
@@ -805,7 +803,7 @@ RPCHelpMan dumpwallet()
             } else {
                 file << "change=1";
             }
-            file << strprintf(" # addr=%s%s\n", strAddr, (metadata.has_key_origin ? " hdkeypath="+WriteHDKeypath(metadata.key_origin.path) : ""));
+            file << strprintf(" # addr=%s%s\n", strAddr, (metadata.has_key_origin ? " hdkeypath="+WriteHDKeypath(metadata.key_origin.path, /*apostrophe=*/true) : ""));
         }
     }
     file << "\n";
@@ -828,7 +826,7 @@ RPCHelpMan dumpwallet()
     file.close();
 
     UniValue reply(UniValue::VOBJ);
-    reply.pushKV("filename", filepath.u8string());
+    reply.pushKV("filename", filepath.utf8string());
 
     return reply;
 },
@@ -856,6 +854,7 @@ enum class ScriptContext
 
 // Analyse the provided scriptPubKey, determining which keys and which redeem scripts from the ImportData struct are needed to spend it, and mark them as used.
 // Returns an error string, or the empty string for success.
+// NOLINTNEXTLINE(misc-no-recursion)
 static std::string RecurseImportData(const CScript& script, ImportData& import_data, const ScriptContext script_ctx)
 {
     // Use Solver to obtain script type and parsed pubkeys or hashes:
@@ -1297,12 +1296,12 @@ RPCHelpMan importmulti()
                                 },
                             },
                         },
-                        RPCArgOptions{.oneline_description="\"requests\""}},
-                    {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                        RPCArgOptions{.oneline_description="requests"}},
+                    {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                         {
                             {"rescan", RPCArg::Type::BOOL, RPCArg::Default{true}, "Scan the chain and mempool for wallet transactions after all imports."},
                         },
-                        RPCArgOptions{.oneline_description="\"options\""}},
+                        RPCArgOptions{.oneline_description="options"}},
                 },
                 RPCResult{
                     RPCResult::Type::ARR, "", "Response is an array with the same size as the input that has the execution result",
@@ -1617,7 +1616,7 @@ RPCHelpMan importdescriptors()
                                 },
                             },
                         },
-                        RPCArgOptions{.oneline_description="\"requests\""}},
+                        RPCArgOptions{.oneline_description="requests"}},
                 },
                 RPCResult{
                     RPCResult::Type::ARR, "", "Response is an array with the same size as the input that has the execution result",
@@ -1862,7 +1861,7 @@ RPCHelpMan listdescriptors()
 RPCHelpMan backupwallet()
 {
     return RPCHelpMan{"backupwallet",
-                "\nSafely copies current wallet file to destination, which can be a directory or a path with filename.\n",
+                "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
                 },
@@ -1897,7 +1896,7 @@ RPCHelpMan restorewallet()
 {
     return RPCHelpMan{
         "restorewallet",
-        "\nRestore and loads a wallet from backup.\n"
+        "\nRestores and loads a wallet from backup.\n"
         "\nThe rescan is significantly faster if a descriptor wallet is restored"
         "\nand block filters are available (using startup option \"-blockfilterindex=1\").\n",
         {
@@ -1909,8 +1908,7 @@ RPCHelpMan restorewallet()
             RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::STR, "name", "The wallet name if restored successfully."},
-                {RPCResult::Type::STR, "warning", /*optional=*/true, "Warning messages, if any, related to restoring the wallet. Multiple messages will be delimited by newlines. (DEPRECATED, returned only if config option -deprecatedrpc=walletwarningfield is passed.)"},
-                {RPCResult::Type::ARR, "warnings", /*optional=*/true, "Warning messages, if any, related to restoring the wallet.",
+                {RPCResult::Type::ARR, "warnings", /*optional=*/true, "Warning messages, if any, related to restoring and loading the wallet.",
                 {
                     {RPCResult::Type::STR, "", ""},
                 }},
@@ -1943,9 +1941,6 @@ RPCHelpMan restorewallet()
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("name", wallet->GetName());
-    if (wallet->chain().rpcEnableDeprecated("walletwarningfield")) {
-        obj.pushKV("warning", Join(warnings, Untranslated("\n")).original);
-    }
     PushWarnings(warnings, obj);
 
     return obj;
